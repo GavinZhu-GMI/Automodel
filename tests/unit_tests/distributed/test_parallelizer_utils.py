@@ -934,3 +934,59 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
         model.b: torch.float16,
         model.c: torch.bfloat16,
     }
+
+
+def test_fully_shard_by_dtype_fp32_lora_beside_fp32_holder():
+    """fp32 LoRA on a bf16 linear next to an fp32-compute holder (Qwen3.5 GatedDeltaNet + LoRA).
+
+    Three (storage, compute) keys meet in one block: the bf16 base weights, the fp32-storage
+    LoRA factors that compute in bf16, and the fp32 holder. LinearLoRA owns its bf16 weight
+    directly beside its fp32 lora_A/lora_B children, so no uniform subtree covers that weight:
+    the block itself must own it, and each other key gets its own unit.
+    """
+    from nemo_automodel.components._peft.lora import LinearLoRA
+
+    class Fp32Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    class LinearAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self._fp32_params = Fp32Holder()
+
+    class Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up_proj = LinearLoRA(nn.Linear(4, 8, bias=False).to(torch.bfloat16), dim=2, alpha=2,
+                                      lora_dtype=torch.float32)
+            self.down_proj = LinearLoRA(nn.Linear(8, 4, bias=False).to(torch.bfloat16), dim=2, alpha=2,
+                                        lora_dtype=torch.float32)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_attn = LinearAttn()
+            self.mlp = Mlp()
+
+    block = Block()
+    calls: list[tuple[nn.Module, dict]] = []
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        fp32_compute_module_names=("_fp32_params",),
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    units = {id(module): (module, kwargs["mp_policy"].param_dtype) for module, kwargs in calls}
+    lora_children = [m for p in (block.mlp.up_proj, block.mlp.down_proj) for m in (p.lora_A, p.lora_B)]
+    expected = {id(m): torch.bfloat16 for m in lora_children}
+    expected[id(block.linear_attn._fp32_params)] = torch.float32
+    expected[id(block)] = torch.bfloat16
+    assert {k: dtype for k, (_, dtype) in units.items()} == expected
+    # the block's own unit is the last call, after its children
+    assert calls[-1][0] is block

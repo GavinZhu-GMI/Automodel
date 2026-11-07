@@ -398,13 +398,26 @@ def fully_shard_by_dtype(
                 return_paths=True,
             )
         )
+        if len(grouped_params) == 2:
+            parent_key = next(key for key in grouped_params if key != least_items_key)
+        else:
+            # 3+ keys: when exactly one key has parameters that no uniform subtree covers
+            # (e.g. a LinearLoRA's bf16 weight beside its fp32 lora_A/lora_B), the module
+            # itself owns that key, as the majority does in the two-key case.
+            subtree_param_ids = {
+                id(param) for _, subtree, _ in uniform_subtrees for param in subtree.parameters()
+            }
+            uncovered_keys = {
+                key
+                for key, params in grouped_params.items()
+                if any(id(param) not in subtree_param_ids for param in params)
+            }
+            parent_key = next(iter(uncovered_keys)) if len(uncovered_keys) == 1 else None
         selected_subtrees = [
-            (path, key, subtree)
-            for path, subtree, key in uniform_subtrees
-            if (len(grouped_params) == 2 and key == least_items_key) or len(grouped_params) > 2
+            (path, key, subtree) for path, subtree, key in uniform_subtrees if parent_key is None or key != parent_key
         ]
 
-        expected_keys = {least_items_key} if len(grouped_params) == 2 else set(grouped_params)
+        expected_keys = set(grouped_params) - ({parent_key} if parent_key is not None else set())
         expected_param_ids = {id(param) for key in expected_keys for param in grouped_params[key]}
         covered_param_ids = {
             id(param)
@@ -432,8 +445,7 @@ def fully_shard_by_dtype(
             if fully_shard_fn is not None:
                 subtree_kwargs["fully_shard_fn"] = fully_shard_fn
             _fully_shard(_get_module_from_path(module, path), **subtree_kwargs)
-        if len(grouped_params) == 2:
-            parent_key = next(key for key in grouped_params if key != least_items_key)
+        if parent_key is not None:
             _call_fully_shard(
                 module,
                 mesh,
