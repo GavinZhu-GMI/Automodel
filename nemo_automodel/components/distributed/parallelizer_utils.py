@@ -398,21 +398,20 @@ def fully_shard_by_dtype(
                 return_paths=True,
             )
         )
-        if len(grouped_params) == 2:
+        # When exactly one key has parameters that no uniform subtree covers (e.g. a
+        # LinearLoRA's bf16 weight beside its fp32 lora_A/lora_B), the module itself owns
+        # that key, whatever its count. Otherwise two keys keep the minority-subtree rule
+        # and 3+ keys shard every uniform subtree.
+        subtree_param_ids = {id(param) for _, subtree, _ in uniform_subtrees for param in subtree.parameters()}
+        uncovered_keys = {
+            key for key, params in grouped_params.items() if any(id(param) not in subtree_param_ids for param in params)
+        }
+        if len(uncovered_keys) == 1:
+            parent_key = next(iter(uncovered_keys))
+        elif len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
         else:
-            # 3+ keys: when exactly one key has parameters that no uniform subtree covers
-            # (e.g. a LinearLoRA's bf16 weight beside its fp32 lora_A/lora_B), the module
-            # itself owns that key, as the majority does in the two-key case.
-            subtree_param_ids = {
-                id(param) for _, subtree, _ in uniform_subtrees for param in subtree.parameters()
-            }
-            uncovered_keys = {
-                key
-                for key, params in grouped_params.items()
-                if any(id(param) not in subtree_param_ids for param in params)
-            }
-            parent_key = next(iter(uncovered_keys)) if len(uncovered_keys) == 1 else None
+            parent_key = None
         selected_subtrees = [
             (path, key, subtree) for path, subtree, key in uniform_subtrees if parent_key is None or key != parent_key
         ]

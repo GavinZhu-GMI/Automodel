@@ -990,3 +990,37 @@ def test_fully_shard_by_dtype_fp32_lora_beside_fp32_holder():
     assert {k: dtype for k, (_, dtype) in units.items()} == expected
     # the block's own unit is the last call, after its children
     assert calls[-1][0] is block
+
+
+def test_fully_shard_by_dtype_fp32_lora_outnumbering_base_params():
+    """Two keys where the fp32 LoRA factors outnumber the bf16 base parameters (a LoRA'd attention block).
+
+    The uncovered key (the bf16 weights each LinearLoRA owns directly) must be the parent's even though it
+    is the minority by count; the LoRA children get their own units.
+    """
+    from nemo_automodel.components._peft.lora import LinearLoRA
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(self, name, LinearLoRA(nn.Linear(4, 4, bias=False).to(torch.bfloat16), dim=2, alpha=2,
+                                               lora_dtype=torch.float32))
+            self.q_norm = nn.LayerNorm(4, bias=False).to(torch.bfloat16)
+
+    block = Attn()
+    calls: list[tuple[nn.Module, dict]] = []
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    units = {id(module): kwargs["mp_policy"].param_dtype for module, kwargs in calls}
+    projs = (block.q_proj, block.k_proj, block.v_proj, block.o_proj)
+    expected = {id(m): torch.bfloat16 for p in projs for m in (p.lora_A, p.lora_B)}
+    expected[id(block)] = torch.bfloat16
+    assert units == expected
+    assert calls[-1][0] is block
